@@ -100,10 +100,6 @@ Contributions are welcome! Please feel free to submit a Pull Request.
    - Run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
    - Or use `powershell.exe -ExecutionPolicy Bypass -File .\Set-GameAffinity.ps1`
 
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ## Disclaimer
 
 Use this script at your own risk. Modifying CPU affinity can affect process performance and system stability. Always test in a safe environment first.
