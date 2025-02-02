@@ -1,11 +1,12 @@
 # Configuration
 param (
-    [int]$WaitTimeSeconds = 5,
-    [string[]]$ProcessNames = @("RainbowSix_DX11", "scimitar_engine_win64_2022_flto_dx11"),
-    [bool]$VerboseOutput = $true
+    [int]$WaitTimeSeconds = 2,
+    [string[]]$ProcessNames = @("RainbowSix_DX11", "scimitar_engine_win64_2022_flto_dx11", "RainbowSix"),
+    [bool]$VerboseOutput = $true,
+    [ValidateSet("DEBUG", "INFO", "ERROR")] [string]$LogLevel = "INFO"
 )
 
-# Fonction pour obtenir le masque d'affinité pour tous les processeurs
+# Fonction pour obtenir le masque d'affinite pour tous les processeurs
 function Get-AllCpusMask {
     $processorCount = (Get-WmiObject -Class Win32_ComputerSystem).NumberOfLogicalProcessors
     return [int64]([math]::Pow(2, $processorCount) - 1)
@@ -18,13 +19,26 @@ function Write-LogMessage {
         [string]$Type = "INFO"
     )
     
-    if ($VerboseOutput) {
+    if ($VerboseOutput -and (ShouldLogMessage -Type $Type)) {
         $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         Write-Host "[$timestamp] $Type : $Message"
     }
 }
 
-# Fonction pour vérifier et modifier l'affinité d'un processus
+# Fonction pour determiner si un message doit Ãªtre logge
+function ShouldLogMessage {
+    param([string]$Type)
+    
+    $logLevels = @{
+        "DEBUG" = 1
+        "INFO"  = 2
+        "ERROR" = 3
+    }
+    
+    return $logLevels[$Type] -ge $logLevels[$LogLevel]
+}
+
+# Fonction pour verifier et modifier l'affinite d'un processus
 function Set-GameProcessAffinity {
     param (
         [string]$ProcessName,
@@ -36,7 +50,7 @@ function Set-GameProcessAffinity {
         $oldAffinity = $process.ProcessorAffinity.ToInt64()
         $process.ProcessorAffinity = [IntPtr]::new($AffinityMask)
         
-        Write-LogMessage "$ProcessName : Affinité modifiée de $oldAffinity à $AffinityMask"
+        Write-LogMessage "$ProcessName : Affinite modifiee de $oldAffinity a $AffinityMask"
         return $process
     }
     catch {
@@ -45,7 +59,7 @@ function Set-GameProcessAffinity {
     }
 }
 
-# Fonction pour réinitialiser l'affinité d'un processus
+# Fonction pour reinitialiser l'affinite d'un processus
 function Reset-GameProcessAffinity {
     param (
         [System.Diagnostics.Process]$Process,
@@ -57,47 +71,57 @@ function Reset-GameProcessAffinity {
     try {
         $oldAffinity = $Process.ProcessorAffinity.ToInt64()
         $Process.ProcessorAffinity = [IntPtr]::new($AllCpusMask)
-        Write-LogMessage "$($Process.ProcessName) : Affinité réinitialisée de $oldAffinity à $AllCpusMask"
+        Write-LogMessage "$($Process.ProcessName) : Affinite reinitialisee de $oldAffinity a $AllCpusMask"
     }
     catch {
-        Write-LogMessage "Erreur lors de la réinitialisation pour $($Process.ProcessName) : $_" -Type "ERROR"
+        Write-LogMessage "Erreur lors de la reinitialisation pour $($Process.ProcessName) : $_" -Type "ERROR"
     }
 }
 
 # Script principal
 try {
     $startTime = Get-Date
-    Write-LogMessage "Démarrage du script d'affinité CPU"
+    Write-LogMessage "Demarrage du script d'affinite CPU"
     
     $allCpusMask = Get-AllCpusMask
     Write-LogMessage "Masque pour tous les CPUs : $allCpusMask"
     
-    # Stockage des processus modifiés
-    $modifiedProcesses = @()
+    # Recuperation des processus
+    $allProcesses = Get-Process | Where-Object { $ProcessNames -contains $_.ProcessName }
+    $foundNames = $allProcesses.ProcessName | Select-Object -Unique
     
-    # Définir l'affinité initiale pour tous les processus
-    foreach ($processName in $ProcessNames) {
-        $process = Set-GameProcessAffinity -ProcessName $processName
-        if ($null -ne $process) {
-            $modifiedProcesses += $process
+    # Journalisation detaillee
+    Write-LogMessage "Recherche des processus..." -Type "DEBUG"
+    foreach ($name in $ProcessNames) {
+        if ($foundNames -contains $name) {
+            Write-LogMessage "[Yes] Processus trouve : $name" -Type "INFO"
         }
+        else {
+            Write-LogMessage "[No] Processus non trouve : $name" -Type "ERROR"
+        }
+    }
+    
+    # Modification de l'affinite
+    $modifiedProcesses = @()
+    foreach ($process in $allProcesses) {
+        $modifiedProcess = Set-GameProcessAffinity -ProcessName $process.ProcessName
+        if ($modifiedProcess) { $modifiedProcesses += $modifiedProcess }
     }
     
     Write-LogMessage "Attente de $WaitTimeSeconds secondes..."
     Start-Sleep -Seconds $WaitTimeSeconds
     
-    # Réinitialiser l'affinité pour tous les processus
+    # Reinitialisation de l'affinite
     foreach ($process in $modifiedProcesses) {
         Reset-GameProcessAffinity -Process $process -AllCpusMask $allCpusMask
     }
     
     $duration = (Get-Date - $startTime).TotalSeconds
-    Write-LogMessage "Script terminé en $($duration.ToString('0.00')) secondes"
+    Write-LogMessage "Script termine en $($duration.ToString('0.00')) secondes"
 }
 catch {
     Write-LogMessage "Erreur fatale : $_" -Type "ERROR"
 }
 finally {
-    # Nettoyage si nécessaire
     $modifiedProcesses = $null
 }
