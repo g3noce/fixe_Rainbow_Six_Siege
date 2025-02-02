@@ -1,127 +1,133 @@
 # Configuration
 param (
     [int]$WaitTimeSeconds = 2,
+    [ValidateNotNullOrEmpty()]
     [string[]]$ProcessNames = @("RainbowSix_DX11", "scimitar_engine_win64_2022_flto_dx11", "RainbowSix"),
+    [int64]$TempAffinityMask = 1,
     [bool]$VerboseOutput = $true,
-    [ValidateSet("DEBUG", "INFO", "ERROR")] [string]$LogLevel = "INFO"
+    [ValidateSet("DEBUG", "INFO", "ERROR")][string]$LogLevel = "INFO",
+    [string]$LogFile = ""
 )
 
-# Function to get the affinity mask for all CPUs
+# Elevation Check
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "This script requires Administrator privileges. Please run as Admin."
+    exit 1
+}
+
+# CPU Functions
 function Get-AllCpusMask {
-    $processorCount = (Get-WmiObject -Class Win32_ComputerSystem).NumberOfLogicalProcessors
+    $processorCount = (Get-CimInstance -ClassName Win32_ComputerSystem).NumberOfLogicalProcessors
     return [int64]([math]::Pow(2, $processorCount) - 1)
 }
 
-# Function to log messages with a timestamp
+# Logging System
+function ShouldLogMessage {
+    param([string]$Type)
+    $logLevels = @{"DEBUG"=1; "INFO"=2; "ERROR"=3}
+    return $logLevels[$Type] -ge $logLevels[$LogLevel]
+}
+
 function Write-LogMessage {
     param(
         [string]$Message,
         [string]$Type = "INFO"
     )
     
-    if ($VerboseOutput -and (ShouldLogMessage -Type $Type)) {
-        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        Write-Host "[$timestamp] $Type : $Message"
-    }
+    if (-not (ShouldLogMessage -Type $Type)) { return }
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logLine = "[$timestamp] $Type : $Message"
+    
+    if ($VerboseOutput) { Write-Host $logLine }
+    if ($LogFile) { Add-Content -Path $LogFile -Value $logLine -Force }
 }
 
-# Function to determine if a message should be logged
-function ShouldLogMessage {
-    param([string]$Type)
-    
-    $logLevels = @{
-        "DEBUG" = 1
-        "INFO"  = 2
-        "ERROR" = 3
-    }
-    
-    return $logLevels[$Type] -ge $logLevels[$LogLevel]
-}
-
-# Function to check and modify the affinity of a process
-function Set-GameProcessAffinity {
+# Affinity Management
+function Set-ProcessAffinity {
     param (
-        [string]$ProcessName,
-        [int64]$AffinityMask = 1
+        [System.Diagnostics.Process]$Process,
+        [int64]$AffinityMask
     )
     
     try {
-        $process = Get-Process $ProcessName -ErrorAction Stop
-        $oldAffinity = $process.ProcessorAffinity.ToInt64()
-        $process.ProcessorAffinity = [IntPtr]::new($AffinityMask)
+        if ($Process.HasExited) {
+            Write-LogMessage "Process $($Process.Name) no longer exists" -Type "WARN"
+            return $null
+        }
         
-        Write-LogMessage "$ProcessName : Affinity changed from $oldAffinity to $AffinityMask"
-        return $process
+        $oldAffinity = $Process.ProcessorAffinity.ToInt64()
+        $Process.ProcessorAffinity = [IntPtr]::new($AffinityMask)
+        Write-LogMessage "$($Process.Name) affinity changed: $oldAffinity → $AffinityMask" -Type "DEBUG"
+        
+        return $Process
     }
     catch {
-        Write-LogMessage "Error for $ProcessName : $_" -Type "ERROR"
+        Write-LogMessage "Error modifying $($Process.Name): $_" -Type "ERROR"
         return $null
     }
 }
 
-# Function to reset the affinity of a process
-function Reset-GameProcessAffinity {
-    param (
-        [System.Diagnostics.Process]$Process,
-        [int64]$AllCpusMask
-    )
-    
-    if ($null -eq $Process) { return }
-    
-    try {
-        $oldAffinity = $Process.ProcessorAffinity.ToInt64()
-        $Process.ProcessorAffinity = [IntPtr]::new($AllCpusMask)
-        Write-LogMessage "$($Process.ProcessName) : Affinity reset from $oldAffinity to $AllCpusMask"
-    }
-    catch {
-        Write-LogMessage "Error resetting affinity for $($Process.ProcessName) : $_" -Type "ERROR"
-    }
-}
-
-# Main script
+# Main Execution
 try {
     $startTime = Get-Date
-    Write-LogMessage "Starting CPU affinity script"
+    Write-LogMessage "Starting CPU Affinity Manager" -Type "INFO"
     
+    # Get System Information
     $allCpusMask = Get-AllCpusMask
-    Write-LogMessage "Mask for all CPUs : $allCpusMask"
-    
-    # Retrieving processes
-    $allProcesses = Get-Process | Where-Object { $ProcessNames -contains $_.ProcessName }
-    $foundNames = $allProcesses.ProcessName | Select-Object -Unique
-    
-    # Detailed logging
-    Write-LogMessage "Searching for processes..." -Type "DEBUG"
+    Write-LogMessage "System CPU Mask: $allCpusMask" -Type "DEBUG"
+
+    # Process Discovery
+    $targetProcesses = @()
     foreach ($name in $ProcessNames) {
-        if ($foundNames -contains $name) {
-            Write-LogMessage "[Yes] Process found : $name" -Type "INFO"
+        try {
+            $processes = Get-Process -Name $name -ErrorAction Stop
+            foreach ($process in $processes) {
+                $targetProcesses += $process
+                Write-LogMessage "Found process: $($process.Name) (ID: $($process.Id))" -Type "INFO"
+            }
+        }
+        catch {
+            Write-LogMessage "Process not found: $name" -Type "WARN"
+        }
+    }
+
+    # Apply Temporary Affinity
+    $modifiedProcesses = @()
+    foreach ($process in $targetProcesses) {
+        if ($modified = Set-ProcessAffinity -Process $process -AffinityMask $TempAffinityMask) {
+            $modifiedProcesses += $modified
+        }
+    }
+
+    # Wait Period
+    if ($modifiedProcesses.Count -gt 0) {
+        Write-LogMessage "Applying $WaitTimeSeconds second delay..." -Type "INFO"
+        Start-Sleep -Seconds $WaitTimeSeconds
+    }
+    else {
+        Write-LogMessage "No processes modified, exiting early" -Type "WARN"
+        exit
+    }
+
+    # Restore Original Affinity
+    foreach ($process in $modifiedProcesses) {
+        if (-not $process.HasExited) {
+            Set-ProcessAffinity -Process $process -AffinityMask $allCpusMask | Out-Null
         }
         else {
-            Write-LogMessage "[No] Process not found : $name" -Type "ERROR"
+            Write-LogMessage "Skipping exited process: $($process.Name)" -Type "DEBUG"
         }
     }
-    
-    # Modifying affinity
-    $modifiedProcesses = @()
-    foreach ($process in $allProcesses) {
-        $modifiedProcess = Set-GameProcessAffinity -ProcessName $process.ProcessName
-        if ($modifiedProcess) { $modifiedProcesses += $modifiedProcess }
-    }
-    
-    Write-LogMessage "Waiting for $WaitTimeSeconds seconds..."
-    Start-Sleep -Seconds $WaitTimeSeconds
-    
-    # Resetting affinity
-    foreach ($process in $modifiedProcesses) {
-        Reset-GameProcessAffinity -Process $process -AllCpusMask $allCpusMask
-    }
-    
-    $duration = (Get-Date - $startTime).TotalSeconds
-    Write-LogMessage "Script completed in $($duration.ToString('0.00')) seconds"
+
+    # Performance Metrics
+    $duration = (Get-Date) - $startTime
+    Write-LogMessage "Operation completed in $($duration.TotalSeconds.ToString('0.00'))s" -Type "INFO"
 }
 catch {
-    Write-LogMessage "Fatal error : $_" -Type "ERROR"
+    Write-LogMessage "Fatal error: $_" -Type "ERROR"
+    exit 1
 }
 finally {
-    $modifiedProcesses = $null
+    if ($LogFile) { Write-LogMessage "Log saved to: $LogFile" -Type "INFO" }
 }
